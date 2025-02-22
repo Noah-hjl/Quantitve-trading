@@ -1,0 +1,286 @@
+#include <iostream>
+#include <vector>
+#include <numeric>
+#include <fstream>
+#include <string>
+#include <thread>
+#include <chrono>
+#include <ctime>
+#include <iomanip>
+#include <curl/curl.h>
+#include <json/json.h>
+#include <cmath>
+#include <stdexcept>
+#include <algorithm>
+
+using namespace std;
+
+// 日志记录单例类
+class Logger {
+public:
+    static void log(const string& message) {
+        lock_guard<mutex> lock(logMutex);
+        ofstream file("trading.log", ios::app);
+        auto now = chrono::system_clock::now();
+        time_t time = chrono::system_clock::to_time_t(now);
+        file << put_time(localtime(&time), "%Y-%m-%d %H:%M:%S") << " | " << message << endl;
+    }
+
+private:
+    static mutex logMutex;
+};
+mutex Logger::logMutex;
+
+class TradingSystem {
+private:
+    // 配置参数
+    string symbol;
+    int shortPeriod = 5;
+    int longPeriod = 20;
+    int rsiPeriod = 14;
+    double maxPosition = 1000.0;
+    double accountBalance = 100000.0;
+    double riskPerTrade = 0.02;
+    
+    // 状态管理
+    enum class TradeState { WAIT_TO_BUY, WAIT_TO_SELL };
+    TradeState tradeState = TradeState::WAIT_TO_BUY;
+    
+    // 市场数据
+    vector<double> priceHistory;
+    double currentPrice = 0.0;
+    double position = 0.0;
+    double stopLoss = 0.0;
+
+    // 性能优化
+    double shortSum = 0.0;
+    double longSum = 0.0;
+
+public:
+    explicit TradingSystem(const string& sym) : symbol(sym) {
+        initializeData();
+    }
+
+    void run() {
+        try {
+            while (true) {
+                fetchMarketData();
+                updateIndicators();
+                
+                checkStopLoss();
+                checkTakeProfit();
+                
+                if (shouldEnterTrade()) executeTrade();
+                if (shouldExitTrade()) closeTrade();
+
+                this_thread::sleep_for(chrono::minutes(1));
+            }
+        } catch (const exception& e) {
+            Logger::log("系统异常: " + string(e.what()));
+            cerr << "系统异常: " << e.what() << endl;
+        }
+    }
+
+private:
+    // 初始化历史数据
+    void initializeData() {
+        // 这里可以替换为从文件或数据库加载历史数据
+        for (int i = 0; i < longPeriod; ++i) {
+            double price = 100.0 + (rand() % 100);
+            priceHistory.push_back(price);
+        }
+        updateSums();
+    }
+
+    // 更新滑动窗口和
+    void updateSums() {
+        shortSum = accumulate(priceHistory.end() - shortPeriod, priceHistory.end(), 0.0);
+        longSum = accumulate(priceHistory.end() - longPeriod, priceHistory.end(), 0.0);
+    }
+
+    // 获取市场数据
+    void fetchMarketData() {
+        CURL* curl = curl_easy_init();
+        if (!curl) throw runtime_error("CURL初始化失败");
+
+        string readBuffer;
+        const char* apiKey = getenv("ALPHA_VANTAGE_KEY");
+        if (!apiKey) throw runtime_error("未找到API密钥");
+
+        string url = "https://www.alphavantage.co/query?function=TIME_SERIES_INTRADAY&symbol=" 
+                   + symbol + "&interval=1min&apikey=" + apiKey;
+
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
+
+        CURLcode res = curl_easy_perform(curl);
+        if (res != CURLE_OK) {
+            curl_easy_cleanup(curl);
+            throw runtime_error("API请求失败: " + string(curl_easy_strerror(res)));
+        }
+
+        processResponse(readBuffer);
+        curl_easy_cleanup(curl);
+    }
+
+    // 处理API响应
+    void processResponse(const string& response) {
+        Json::Value root;
+        Json::CharReaderBuilder builder;
+        istringstream iss(response);
+
+        if (!parseFromStream(builder, iss, &root, nullptr) {
+            throw runtime_error("JSON解析失败");
+        }
+
+        if (root.isMember("Error Message")) {
+            throw runtime_error("API错误: " + root["Error Message"].asString());
+        }
+
+        string latestTime = root["Meta Data"]["3. Last Refreshed"].asString();
+        currentPrice = root["Time Series (1min)"][latestTime]["1. open"].asDouble();
+        priceHistory.push_back(currentPrice);
+        updateSums();
+    }
+
+    // 更新技术指标
+    void updateIndicators() {
+        // 动态计算止损价格（示例：ATR止损）
+        double atr = calculateATR(14);
+        stopLoss = currentPrice - 2 * atr;
+    }
+
+    // 计算平均真实波幅（ATR）
+    double calculateATR(int period) {
+        vector<double> trueRanges;
+        for (size_t i = 1; i < priceHistory.size(); ++i) {
+            double high = priceHistory[i];
+            double low = priceHistory[i-1];
+            trueRanges.push_back(high - low);
+        }
+        
+        if (trueRanges.size() < period) return 0.0;
+        return accumulate(trueRanges.end() - period, trueRanges.end(), 0.0) / period;
+    }
+
+    // 计算RSI
+    double calculateRSI() {
+        if (priceHistory.size() < rsiPeriod + 1) return 50.0;
+
+        vector<double> gains, losses;
+        for (int i = priceHistory.size() - rsiPeriod; i < priceHistory.size(); ++i) {
+            double change = priceHistory[i] - priceHistory[i-1];
+            gains.push_back(max(change, 0.0));
+            losses.push_back(max(-change, 0.0));
+        }
+
+        double avgGain = accumulate(gains.begin(), gains.end(), 0.0) / rsiPeriod;
+        double avgLoss = accumulate(losses.begin(), losses.end(), 0.0) / rsiPeriod;
+
+        if (avgLoss < 1e-6) return 100.0;
+        return 100.0 - (100.0 / (1 + (avgGain / avgLoss)));
+    }
+
+    // 交易信号判断
+    bool shouldEnterTrade() {
+        if (tradeState != TradeState::WAIT_TO_BUY) return false;
+
+        double shortMA = shortSum / shortPeriod;
+        double longMA = longSum / longPeriod;
+        double rsi = calculateRSI();
+
+        return (shortMA > longMA) && (rsi < 30.0);
+    }
+
+    bool shouldExitTrade() {
+        if (tradeState != TradeState::WAIT_TO_SELL) return false;
+
+        double shortMA = shortSum / shortPeriod;
+        double longMA = longSum / longPeriod;
+        double rsi = calculateRSI();
+
+        return (shortMA < longMA) || (rsi > 70.0);
+    }
+
+    // 执行交易
+    void executeTrade() {
+        double positionSize = calculatePositionSize();
+        position = min(positionSize, maxPosition);
+
+        string msg = "买入 " + symbol + " " + to_string(position) 
+                   + " 股，价格: " + to_string(currentPrice);
+        Logger::log(msg);
+        cout << msg << endl;
+
+        tradeState = TradeState::WAIT_TO_SELL;
+    }
+
+    void closeTrade() {
+        string msg = "卖出 " + symbol + " " + to_string(position)
+                   + " 股，价格: " + to_string(currentPrice);
+        Logger::log(msg);
+        cout << msg << endl;
+
+        position = 0.0;
+        tradeState = TradeState::WAIT_TO_BUY;
+    }
+
+    // 风险管理
+    double calculatePositionSize() {
+        double riskAmount = accountBalance * riskPerTrade;
+        double riskPerShare = currentPrice - stopLoss;
+        return riskAmount / riskPerShare;
+    }
+
+    void checkStopLoss() {
+        if (currentPrice <= stopLoss && position > 0) {
+            string msg = "触发止损! 价格: " + to_string(currentPrice);
+            Logger::log(msg);
+            closeTrade();
+        }
+    }
+
+    void checkTakeProfit() {
+        // 示例：移动止盈策略
+        static double highestPrice = 0.0;
+        highestPrice = max(highestPrice, currentPrice);
+        
+        if (currentPrice < highestPrice * 0.95 && position > 0) {
+            string msg = "触发止盈! 价格: " + to_string(currentPrice);
+            Logger::log(msg);
+            closeTrade();
+        }
+    }
+
+    // CURL回调函数
+    static size_t writeCallback(void* contents, size_t size, size_t nmemb, string* buffer) {
+        size_t totalSize = size * nmemb;
+        buffer->append((char*)contents, totalSize);
+        return totalSize;
+    }
+};
+
+int main() {
+    try {
+        TradingSystem ts("AAPL");
+        ts.run();
+    } catch (const exception& e) {
+        cerr << "系统启动失败: " << e.what() << endl;
+        return 1;
+    }
+    return 0;
+}
+
+
+
+安装依赖库：libcurl\jsoncpp: sudo apt-get install libcurl4-openssl-dev libjsoncpp-dev
+
+设置API密钥环境变量：export ALPHA_VANTAGE_KEY="your_api_key_here"
+
+扩展建议：// 可添加的功能接口
+void addTechnicalIndicator(const string& indicatorName); // 添加其他指标
+void connectToBrokerAPI(const string& apiEndpoint);      // 连接真实交易接口
+void loadHistoricalData(const string& csvFile);          // 加载历史数据
+
+编译命令：g++ -std=c++17 trading_system.cpp -o trader -lcurl -ljsoncpp -lpthread
